@@ -1,10 +1,22 @@
 #include <WiFi.h>
-#include <Arduino.h>
 #include <HWTelemetry.h>
 #include <AlfredoCRSF.h>
 
-// Used for calculating program execution time. (Accurate battery usage calculations)
-unsigned long  duration;
+// How often to send telemetry, in milliseconds. Do not send telemetry every
+// loop: ELRS only carries it as fast as the Telem Ratio allows, so sending
+// faster does not make it arrive sooner, it just backs up the serial buffer
+// and slows this loop down. Keep this rate within what your ratio can carry.
+// 100ms = @ 10Hz
+#define TELEM_INTERVAL_MS 100   
+
+
+// Duration in micro seconds last program cycle. Used for calculating program execution time. (Accurate battery usage calculations)
+static unsigned long duration = 0;
+//number of milliseconds elapsed since the microcontroller began running when the CRSF values were last updated. Initalized to 0.
+static unsigned long lastRPMUpdate = 0;
+static unsigned long lastTempUpdate = 0; 
+static unsigned long lastGPSUpdate = 0;
+static unsigned long lastRxBtUpdate = 0;
 
 // Structure example to send data
 // Must match the receiver structure
@@ -15,9 +27,9 @@ typedef struct struct_message {
     float Current; //Amps
     float Speed;
     float BECCurrent;
-    double BatteryCap;
-    int16_t ESCTemperature; //deg_C
-    int16_t MotorTemperature; //deg_C
+    double BatteryCap; //Used battery capactiy in mAh
+    int16_t ESCTemperature; //degrees C
+    int16_t MotorTemperature; //degrees C
     uint8_t ThrottleOut;
     uint8_t ThrottleIn;
     uint8_t Direction;
@@ -29,6 +41,7 @@ struct_message myData;
 
 
 HardwareSerial HWSerial(0);  // UART0
+
 HardwareSerial CRSFSerial(1); //UART1
 AlfredoCRSF crsf;
 
@@ -39,7 +52,7 @@ void hwtCallback() {
   myData.Current = HWTelemetry.getCurrent();
   myData.ESCTemperature = HWTelemetry.getESCTemperature();
   myData.MotorTemperature = HWTelemetry.getMotorTemperature();
-  //myData.Speed = HWTelemetry.getSpeed();
+  myData.Speed = HWTelemetry.getSpeed();
   myData.BECCurrent = HWTelemetry.getBECCurrent();
 }
 
@@ -50,18 +63,18 @@ void setup() {
   // Set device as a Wi-Fi Station
   // WiFi.mode(WIFI_STA);
   
-  // UART0 sur GPIO3 (RX actif et TX desactivé avec -1 )
-  HWSerial.begin(115200, SERIAL_8N1, RX, TX);
+  // UART0 for Hobbywing on GPIO20 (RX active and TX disabled with -1)
+  HWSerial.begin(115200, SERIAL_8N1, RX, -1);
   HWSerial.setTimeout(50);
 
   HWTelemetry.begin(HWSerial);
   HWTelemetry.attach(hwtCallback);
   
-  HWTelemetry.setMotorPoles(4);
-  HWTelemetry.setGearRatio(5.7);
-  HWTelemetry.setWheelSize(107);
+  HWTelemetry.setMotorPoles(4); //Set number of motor poles. Used for RPM and Speed Calculations
+  HWTelemetry.setGearRatio(5.7); //Set gear ratio. Taken from AI so who knows ¯\_(ツ)_/¯
+  HWTelemetry.setWheelSize(107); //Set tire size for 1/10 SCT (107mm)
 
-  //UART1 for CRSF 
+  //UART1 for CRSF on GPIO9 and GPIO10 (RX active and TX active)
   CRSFSerial.begin(416666, SERIAL_8N1, 9, 10);
   if (!CRSFSerial) while (1) Serial.print("Invalid CRSFSerial configuration");
   crsf.begin(CRSFSerial);
@@ -75,7 +88,6 @@ void sendChannels_ESPNOW()
     myData.ch[ChannelNum-1] = crsf.getChannel(ChannelNum);
     //Serial.print(crsf.getChannel(ChannelNum));
     //Serial.print(", ");
-
   }
   //Serial.println(" ");
 }
@@ -91,7 +103,7 @@ void sendGps(float latitude, float longitude, float groundspeed, float heading, 
   crsfGps.heading = htobe16((uint16_t)(heading*100.0)); //degrees * 100, so 0-360 degrees fits in 0-36000
   crsfGps.altitude = htobe16((uint16_t)(altitude + 1000.0));
   crsfGps.satellites = (uint8_t)(satellites);
-  crsf.writePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_GPS, &crsfGps, sizeof(crsfGps));
+  crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_GPS, &crsfGps, sizeof(crsfGps));
 }
 
 // Lets a connected handset set its clock from GPS time (requires ELRS 4.1+
@@ -108,7 +120,7 @@ void sendGpsTime(int16_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t
   crsfGpsTime.minute = minute;
   crsfGpsTime.second = second;
   crsfGpsTime.millisecond = htobe16(millisecond);
-  crsf.writePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_GPS_TIME, &crsfGpsTime, sizeof(crsfGpsTime));
+  crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_GPS_TIME, &crsfGpsTime, sizeof(crsfGpsTime));
 }
 
 void sendBaroAltitude(float altitude, float verticalspd)
@@ -146,9 +158,8 @@ void sendTemperature(uint8_t sourceId, const int16_t *values, uint8_t count)
     payload[1 + i*2 + 1] = values[i] & 0xFF;
   }
 
-  crsf.writePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_TEMP, payload, 1 + count*2);
+  crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_TEMP, payload, 1 + count*2);
 }
-
 
 static void sendRxBattery(float voltage, float current, float capacity, float remaining)
 {
@@ -159,7 +170,7 @@ static void sendRxBattery(float voltage, float current, float capacity, float re
   crsfBatt.current = htobe16((uint16_t)(current * 10.0));   //Amps
   crsfBatt.capacity = htobe24((uint32_t)(capacity));        //mAh (24 bit field, max 16777215mAh)
   crsfBatt.remaining = (uint8_t)(remaining);                //percent
-  crsf.writePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_BATTERY_SENSOR, &crsfBatt, sizeof(crsfBatt));
+  crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_BATTERY_SENSOR, &crsfBatt, sizeof(crsfBatt));
 }
 
 // RPM values are signed 24 bit, so each one is packed as three bytes.
@@ -181,7 +192,7 @@ void sendRpm(uint8_t sourceId, const int32_t *values, uint8_t count)
     payload[1 + i*3 + 2] = values[i] & 0xFF;
   }
 
-  crsf.writePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_RPM, payload, 1 + count*3);
+  crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_RPM, payload, 1 + count*3);
 }
 
 
@@ -197,7 +208,7 @@ void sendVoltage(uint8_t voltageIndex, uint16_t millivolts)
   payload[1] = (millivolts >> 8) & 0xFF; // MSB first (BigEndian)
   payload[2] = millivolts & 0xFF;
 
-  crsf.writePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_CELLS, payload, sizeof(payload));
+  crsf.queuePacket(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_CELLS, payload, sizeof(payload));
 }
 
 void printMessages() {
@@ -217,19 +228,19 @@ void printMessages() {
         Serial.println(" (us)");
 }
 
+
+
 void loop() {
   unsigned long startTime = millis();
   unsigned long nowTime = micros();
+
+  // Call HWTelemetry.processInput() every loop to process ESC telemetry data
   HWTelemetry.processInput();
 
-  // Must call crsf.update() in loop() to process data
-  //crsf.update();
-
-  static uint32_t lastUpdate = 0;
-      
+  // Call crsf.update() every loop to process incoming data and keep link state current
+  crsf.update();
 
   //Update @ 100Hz
-  static unsigned long lastRPMUpdate = 0;
   if (startTime - lastRPMUpdate > 10)
   {
       lastRPMUpdate = startTime;
@@ -238,9 +249,8 @@ void loop() {
     sendRpm(0, motorRpm, 1);      
   }
 
-  //Update @ 10Hz
-  static unsigned long lastTempUpdate = 0;
-  if (startTime - lastTempUpdate > 100)
+  //Update @ 10Hz (TELEM_INTERVAL_MS)
+  if (startTime - lastTempUpdate > TELEM_INTERVAL_MS)
   {
     lastTempUpdate = startTime;
     // Flight controller and ambient temperature, in tenths of a degree C
@@ -249,36 +259,25 @@ void loop() {
   } 
 
   //Update @ 8.3Hz
-  static unsigned long lastGPSUpdate = 0;
   if (startTime - lastGPSUpdate > 120)
   {
     lastGPSUpdate = startTime;
-    sendGps(42.12345, -82.12345, 20.5, 20.13, 690, 4);
-    sendGpsTime(2026, 7, 14, 12, 34, 56, 789);
+    sendGps(42.12345, -82.12345, myData.Speed, 20.13, 690, 4);
+    //sendGpsTime(2026, 7, 14, 12, 34, 56, 789);
   }
 
   //sendBaroAltitude(verticalspd, verticalspd);
 
   //Update @ 100Hz
-  static unsigned long lastRxBtUpdate = 0;
   if (startTime - lastRxBtUpdate > 10)
   {
     lastRxBtUpdate = startTime;
     myData.Voltage = millis()/1000; //seconds (for testing)
     sendRxBattery(myData.Voltage, myData.Current, myData.BatteryCap, 100);
-
-    printMessages();
-  }  
-
-
-  static uint32_t lastPrint = 0;
-  if (millis() - lastPrint > 100) 
-  {
-      lastPrint = millis();
-      printMessages();
   }
 
+  //Update used battery capacity (mAh) each program cycle.
   myData.BatteryCap +=((((myData.Current*1000.0f)*duration*1e-6f))/3600.0f); //mAh = mA x duration(s) / 1hr
   unsigned long endTime = micros();
-  duration = endTime - nowTime;
+  duration = endTime - nowTime; 
 }
